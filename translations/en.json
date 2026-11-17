@@ -1,0 +1,28 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to FSL",
+        "description": "Enter the sign-in code for the FSL IoT cloud. It will be saved to renew your access token automatically.",
+        "data": {
+          "code": "Sign-in code"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect to FSL",
+        "description": "Your FSL session could not be renewed. Enter the sign-in code once to save it for future automatic token renewal. Your existing devices and entities will be kept.",
+        "data": {
+          "code": "Sign-in code"
+        }
+      }
+    },
+    "abort": {
+      "reauth_successful": "Authentication was successful."
+    },
+    "error": {
+      "cannot_connect": "Could not reach the FSL IoT cloud. Please check your network and try again.",
+      "invalid_auth": "The sign-in code was rejected. Please check the code and try again.",
+      "unknown": "Unexpected error"
+    }
+  }
+}

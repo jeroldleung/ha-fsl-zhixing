@@ -1,0 +1,12 @@
+{
+  "domain": "fsl",
+  "name": "FSL",
+  "codeowners": ["@jeroldleung"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://www.chinafsl.com",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "requirements": [],
+  "version": "0.1.0"
+}

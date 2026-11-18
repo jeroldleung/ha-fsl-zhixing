@@ -4,7 +4,7 @@
 **Brand / Integration Name:** FSL (`custom_components/fsl`)  
 **Target Platform:** Home Assistant (Core / HACS Custom Integration)  
 **Underlying Hardware & Protocols:** BroadLink Hardware Architecture, FASTCON BLE Gateway UDP Open Interface (v0.8) & Whole-House Device Profile Specification  
-**Current Version Scope:** Lighting-only subset of `docs/default_dev_type.csv` $\cap$ `docs/broadlink_whole_house_device_functions_and_profile_specification.md` (**12 FSL lighting device types** across **7 BroadLink `dev_t` PIDs**)
+**Current Version Scope:** Standard lighting subset of `docs/default_dev_type.csv` $\cap$ `docs/broadlink_whole_house_device_functions_and_profile_specification.md` (**10 FSL lighting device types** across **4 BroadLink `dev_t` PIDs**)
 
 ---
 
@@ -22,7 +22,7 @@ Refactor `custom_components/fsl` from its legacy cloud-polling prototype (`smart
 ### 1.3 Core Objectives
 1. **Zero-Cloud Lighting Control:** Execute all single-light control commands locally over UDP.
 2. **Automatic Topology & Area Discovery:** Retrieve the home manifest (`devlist` and `familyInfo`) via the gateway's temporary HTTP URL (Type 5/6) and map FSL rooms and lights to Home Assistant Areas and Devices automatically.
-3. **Focused Lighting Coverage:** Strictly support the **12 FSL lighting device types** from `docs/default_dev_type.csv` whose `dev_t` exists in `docs/broadlink_whole_house_device_functions_and_profile_specification.md` (`W`, `CW`, `RGB`, `RGBCW`, and Radar/Induction lights).
+3. **Focused Lighting Coverage:** Strictly support the **10 FSL lighting device types** from `docs/default_dev_type.csv` whose `dev_t` exists in `docs/broadlink_whole_house_device_functions_and_profile_specification.md` (`W`, `CW`, `RGB`, and `RGBCW` lights).
 4. **Resilient Session Management:** Maintain reliable local UDP communication through 15-second heartbeat keep-alives, sequence deduplication, and self-healing reconnection logic.
 
 ---
@@ -37,9 +37,9 @@ Refactor `custom_components/fsl` from its legacy cloud-polling prototype (`smart
 |  +-------------+  +---------------+  +-------------------------+  |
 |  | Config Flow |  | Area & Device |  |    Entity Platforms     |  |
 |  |   ("FSL")   |  |   Registry    |  | - light (Primary)       |  |
-|  +------+------+  +-------+-------+  | - switch/number/sensor  |  |
-|         |                 |          |   (Radar Light Ext.)    |  |
-|         v                 v          +------------+------------+  |
+|  +------+------+  +-------+-------+  +------------+------------+  |
+|         |                 |                       |               |
+|         v                 v                       v               |
 |  +-------------------------------------------------------------+  |
 |  |                 FSL DataUpdateCoordinator                   |  |
 |  |  - Lighting PID / type_no / dev_version Resolver            |  |
@@ -91,7 +91,7 @@ Refactor `custom_components/fsl` from its legacy cloud-polling prototype (`smart
 ## 3. Target Lighting Device Catalog & Scope Boundaries
 
 ### 3.1 Filtered FSL Lighting Catalog (`default_dev_type.csv` $\cap$ BroadLink Profile Specification)
-The current version integrates **12 FSL lighting device types** spanning **7 BroadLink `dev_t` PIDs**:
+The current version integrates **10 FSL lighting device types** spanning **4 BroadLink `dev_t` PIDs**:
 
 | `type_no` | Category (`CSV`) | Chinese Name | English Name | Matched `dev_t` | PID (Hex, LE) | `dev_version` | Lighting Class |
 | :---: | :--- | :--- | :--- | :--- | :---: | :---: | :--- |
@@ -105,12 +105,11 @@ The current version integrates **12 FSL lighting device types** spanning **7 Bro
 | `315` | `FAN_LIGHT` | 风扇灯 | fanLight | `43051` | `2b a8` | — | Tunable White (`CW`) |
 | `352` | `UNIVERSAL_COLOR_LIGHT` | 通用彩灯 | UniversalColorLight | `43168` | `a0 a8` | — | Color (`RGB`) |
 | `331` | `KRGBCW_LIGHT` | 可调亮度和色温的彩灯 | krgbcw light | `43050` | `2a a8` | — | Color + CCT (`RGBCW`) |
-| `338` | `LIGHT_INDUCTION` | 微波灯管 | lightInduction | `44876`, `44956` | `4c af`, `9c af` | — | Radar / Induction Light |
-| `347` | `HANGING_WIRE_LAMP_PANEL` | 吊线灯盘 | HangingWireLampPanel | `45160` | `68 b0` | — | Radar / Induction Light |
 
 > **Gateway Transport Role:** The FASTCON BLE Gateway (`325` `GATEWAY` / `43500`, `333` `WIRE_GATEWAY` / `44602`, `345` `4G_WIFI_ROUTER` / `44862`) acts solely as the local UDP bridge and parent device (`via_device`) in the Device Registry.
 
 ### 3.2 Out of Scope for the Current Version
+* **Radar / Induction Lights:** Microwave induction lights (`338` `LIGHT_INDUCTION` / `44876`, `44956`) and hanging wire lamp panels (`347` `HANGING_WIRE_LAMP_PANEL` / `45160`) are deferred from this release.
 * **Group & Scene Mapping / Control:** Lighting group mapping and control (`grouplist` / Type 13) and scene mapping and control (`scenelist` / Type 11) are excluded; grouping and scenes are managed natively within Home Assistant.
 * **Non-Lighting Device Categories:** Relay switches, composite panels, scene panels, curtains, thermostats/HVAC, standalone sensors, and virtual remotes are deferred from this release.
 * **Unmatched / Unverified Lights:**
@@ -128,13 +127,12 @@ The current version integrates **12 FSL lighting device types** spanning **7 Bro
 * **Options Flow:** Allow users to configure polling intervals, enable/disable transition fading (for FW $\ge 58$ lights), and filter ignored devices (`ignoreflag: true`).
 
 ### 4.2 Lighting Platform Specification (`light` platform)
-Supports all **12 matched lighting device types** via the standard 6-byte lighting payload (`[Bri/Power, B, R, G, W, C]`):
+Supports all **10 matched lighting device types** via the standard 6-byte lighting payload (`[Bri/Power, B, R, G, W, C]`):
 * **Color Mode Assignment (via `dev_t` / `spid` and `blecatetory`):**
   * `43049` (`29 a8`, `332` `KW_WHITE_LIGHT`) $\to$ `ColorMode.BRIGHTNESS`
   * `43051` (`2b a8`, `301`–`306`, `315` `FAN_LIGHT`) $\to$ `ColorMode.COLOR_TEMP`
   * `43168` (`a0 a8`, `352` `UNIVERSAL_COLOR_LIGHT`) $\to$ `ColorMode.RGB`
   * `43050` (`2a a8`, `331` `KRGBCW_LIGHT`) $\to$ `ColorMode.RGBWW` (or `ColorMode.HS` + `ColorMode.COLOR_TEMP` mapped onto the 6-byte `Bri/B/R/G/W/C` frame)
-  * `44876`/`44956` (`4c af`/`9c af`, `338` `LIGHT_INDUCTION`) & `45160` (`68 b0`, `347` `HANGING_WIRE_LAMP_PANEL`) $\to$ `ColorMode.BRIGHTNESS` (or `ColorMode.COLOR_TEMP` when warm/cool channels are active per telemetry).
 * **Value Conversions:**
   * **Off Command:** Transmit single byte `0x00` (never 6 zero bytes).
   * **On (Restore):** Transmit `0x80`.
@@ -143,10 +141,6 @@ Supports all **12 matched lighting device types** via the standard 6-byte lighti
   * **Color Temperature:** Map HA Kelvin ($2700\text{ K} - 6500\text{ K}$) to Warm ($W$) and Cool ($C$) channels where $C + W = 255$:
     $$C = \left\lfloor \frac{T_{\text{Kelvin}} - 2700}{6500 - 2700} \times 255 \right\rfloor, \quad W = 255 - C$$
 * **Fade Transitions (Firmware $\ge 58$):** Prepend `0x80` (fade enabled) or `0x00` (instant) when `transition` is supplied on `light.turn_on` / `light.turn_off`.
-* **Radar / Induction Light Extensions (`338`, `347`):** Optionally expose three-stage radar parameters (queried via `91 00 00 00 00 00`) and telemetry (FW $\le \text{v}78$ and $\ge \text{v}79$) on the same FSL HA Device:
-  * `switch`: Radar Enable/Disable (`Byte 0`).
-  * `number`: High/Occupied Brightness ($\%$, `Byte 1`), Mid Brightness ($\%$, `Byte 5`), Standby/Low Brightness ($\%$, `Byte 2`), Unoccupied Hold Time (`nobody_keep_time` in $\text{s}$, `Bytes 3–4` LE), and Mid Brightness Hold Time ($\text{s}$, `Bytes 6–7` LE).
-  * `sensor`: Operating Runtime ($\text{h}$) and Energy Consumption ($\text{kWh}$, from $\frac{\text{Integral} \times 8}{\text{Runtime} \times 127} \times \text{RatedPower} \times \text{Time}$).
 
 ---
 

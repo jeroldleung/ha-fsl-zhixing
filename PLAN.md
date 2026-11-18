@@ -3,7 +3,7 @@
 **Target Version:** `1.0.0` (Local-First `local_push` refactor from `0.1.0` cloud-polling prototype)  
 **Domain:** `fsl` | **Display Name:** `FSL` | **Integration Type:** `hub`  
 **Reference Specs:**
-- [`home_assistant_integration_prd_fsl_smart_home_fastcon_ble_gateway.md`](docs/home_assistant_integration_prd_fsl_smart_home_fastcon_ble_gateway.md) (v1.3)
+- [`PRD.md`](PRD.md) (v1.3)
 - [`fastcon_ble_gateway_udp_open_interface.md`](docs/fastcon_ble_gateway_udp_open_interface.md) (v0.8)
 - [`broadlink_whole_house_device_functions_and_profile_specification.md`](docs/broadlink_whole_house_device_functions_and_profile_specification.md)
 - [`default_dev_type.csv`](docs/default_dev_type.csv)
@@ -16,7 +16,7 @@
 The existing prototype in `custom_components/fsl` is a cloud-polling integration targeting `smart-api.chinafsl.com` (`iot_class: "cloud_polling"`, hardcoded `HOME_ID = 728`, 5-minute polling) with:
 - Token-based cloud authentication (`auth.py`, `config_flow.py`).
 - Limited device coverage: spotlight (`304`), gateway sensor (`325`), and a stubbed infrared controller (`353` in `infrared.py`).
-- No local LAN discovery, no asynchronous telemetry push, no lighting groups or scenes, and no support for tunable color/radar lighting types.
+- No local LAN discovery, no asynchronous telemetry push, and no support for tunable color/radar lighting types.
 
 ### 1.2 Target Architecture (`v1.0.0`)
 Refactor `custom_components/fsl` into a **zero-cloud, local-first (`"iot_class": "local_push"`)** Home Assistant custom integration communicating over the local LAN via **UDP** (`asyncio.DatagramProtocol`) with the **FSL Smart Gateway (BroadLink FASTCON BLE Gateway)** in **Gateway Server Mode**, supplemented by immediate single-use HTTP manifest retrieval from the gateway itself.
@@ -28,12 +28,11 @@ Refactor `custom_components/fsl` into a **zero-cloud, local-first (`"iot_class":
     - `333` (`WIRE_GATEWAY`, `dev_t = 44602` / `3a ae`)
     - `345` (`4G_WIFI_ROUTER`, `dev_t = 44862` / `3e af`)
   - **12 FSL Lighting Device Types across 7 BroadLink `dev_t` PIDs** (`default_dev_type.csv` $\cap$ BroadLink Profile Spec): `W` (`332`), `CW` (`301`–`306`, `315`), `RGB` (`352`), `RGBCW` (`331`), and Radar/Induction Lights (`338`, `347`).
-  - **Native Lighting Group Control** (`Type 13`) mapped from `grouplist` (including virtual group ID conversion).
-  - **Native Scene Entities** (`Type 11`) mapped from `scenelist` (`scene` platform).
   - **Radar / Induction Light Extensions** (`switch`, `number`, `sensor` platforms for `338` and `347`).
   - **Automatic Room/Area Synchronization** mapping `familyInfo.roomlist` to Home Assistant Areas.
   - **Legacy Prototype Removal:** Remove `auth.py`, cloud URLs/token renewal, and `infrared.py` (`353` is out of scope for this release).
 - **Out of Scope (Deferred):**
+  - Group and scene mapping/control (`grouplist` / Type 13, `scenelist` / Type 11, and temporary group Type 19); lighting groups and scenes are handled natively in Home Assistant.
   - Non-lighting categories (relay switches, composite/scene panels, curtains, thermostats/HVAC, standalone sensors, IR/virtual remotes).
   - Unmatched BroadLink light PIDs not in `default_dev_type.csv` (`43169`, `45559`, `45408`, `45161`) and CSV lighting rows without a documented BroadLink `dev_t` profile (`335`, `348`, `349`, `350`, `351`, `356`, `357`, `361`–`364`).
 
@@ -46,19 +45,20 @@ custom_components/fsl/
 ├── __init__.py          # Entry setup/unload, platform forwarding, fsl.reload_devices service
 ├── catalog.py           # 12 lighting & 3 gateway PID/type_no catalog, spid parser, dataclasses
 ├── config_flow.py       # UDP Type 1 LAN discovery, manual setup, unique_id MAC, OptionsFlow
-├── const.py             # Domain, UDP ports/timers, msg types, PIDs, color temp bounds
+├── const.py             # Domain, UDP ports/timers, msg types, color temp bounds
 ├── coordinator.py       # Session lifecycle, Type 5/6 HTTP manifest sync, Area sync, Type 15/17 routing
-├── light.py             # FSLLightEntity (12 types) & FSLLightGroupEntity (Type 13)
+├── light.py             # FSLLightEntity (12 lighting types)
 ├── manifest.json        # domain="fsl", name="FSL", iot_class="local_push", integration_type="hub"
 ├── number.py            # Radar light three-stage brightness & hold-time configuration (338, 347)
-├── scene.py             # FSLSceneEntity triggering Type 11 (3-byte Big-Endian Scene ID)
 ├── sensor.py            # Radar light runtime (h) & energy consumption (kWh) sensors (338, 347)
 ├── services.yaml        # Schema definition for fsl.reload_devices
 ├── strings.json         # UI strings for config flow, options flow, and entity translations
 ├── switch.py            # Radar enable/disable switch for induction lights (338, 347)
 ├── transport.py         # asyncio.DatagramProtocol UDP client, codec, heartbeat, seq deduplication
+├── PRD.md               # Product Requirements Document
+├── PLAN.md              # Implementation plan
 ├── brand/               # Existing icon.png & logo.png for home-assistant/brands
-├── docs/                # PRD, CSV, and BroadLink protocol specs
+├── docs/                # CSV and BroadLink protocol specs
 └── translations/
     └── en.json          # Generated via python3 -m script.translations develop --integration fsl
 ```
@@ -90,13 +90,9 @@ Define protocol, transport, and lighting constants:
   - `MSG_HEARTBEAT_REQ = 3`, `MSG_HEARTBEAT_RESP = 4`
   - `MSG_DEV_URL_REQ = 5`, `MSG_DEV_URL_RESP = 6`
   - `MSG_SHORT_CTRL_REQ = 9`, `MSG_SHORT_CTRL_RESP = 10`
-  - `MSG_SCENE_CTRL_REQ = 11`, `MSG_SCENE_CTRL_RESP = 12`
-  - `MSG_GROUP_CTRL_REQ = 13`, `MSG_GROUP_CTRL_RESP = 14`
   - `MSG_DATA_REPORT_REQ = 15`, `MSG_DATA_REPORT_RESP = 16`
   - `MSG_STATUS_TRIGGER_REQ = 17`, `MSG_STATUS_TRIGGER_RESP = 18`
-  - `MSG_TEMP_GROUP_REQ = 19`, `MSG_TEMP_GROUP_RESP = 20`
 - Lighting constants:
-  - `LIGHT_PARENT_PID = b"\x2a\xa8"` (`2A A8`, `dev_t = 43050`)
   - `MIN_KELVIN = 2700`, `MAX_KELVIN = 6500`
   - `CONF_CLIENT_MAC = "client_mac"`, `CONF_FADE_TRANSITION = "fade_transition"`, `CONF_FILTER_IGNORED = "filter_ignored"`, `CONF_POLL_INTERVAL = "poll_interval"`
 
@@ -110,8 +106,6 @@ Define protocol, transport, and lighting constants:
 - **Typed Dataclasses:**
   - `FSLGatewayInfo`: `mac`, `ip`, `port`, `did`, `name`, `pid`, `dev_t`, `version`.
   - `FSLLightDevice`: `did`, `sdid`, `short_addr: int`, `spid`, `dev_t: int`, `type_no: int | None`, `dev_version: str | None`, `ble_category: str`, `name: str`, `room_id: int`, `room_name: str`, `version: str`, `fw_version: int | None`, `ignore_flag: bool`, `rated_wattage: float | None`.
-  - `FSLGroup`: `group_id: int`, `target_group_id: int`, `name: str`, `ble_category: str`, `room_id: int`, `room_name: str`, `ignore_flag: bool`.
-  - `FSLScene`: `module_id: str`, `scene_seq: int`, `room_id: int`, `room_name: str`, `name: str`, `ignore_flag: bool`.
   - `FSLLightState`: `is_on: bool`, `brightness_ha: int | None`, `color_temp_kelvin: int | None`, `rgb_color: tuple[int, int, int] | None`.
   - `FSLRadarParams`: `radar_enabled: bool`, `high_brightness: int`, `low_brightness: int`, `nobody_keep_time: int`, `mid_brightness: int`, `mid_keep_time: int`, `runtime_seconds: int | None`, `energy_integral: int | None`, `energy_kwh: float | None`.
 
@@ -130,7 +124,7 @@ Implements `FSLUdpClient` backed by `asyncio.DatagramProtocol`:
   - Resets missed-heartbeat counter on every `Type 4` response.
   - If **5 consecutive heartbeats (~75s)** time out, notifies the coordinator to mark entities `unavailable` and initiates an automatic reconnect / re-registration loop.
 - **Request/Response Correlation & Telemetry Callback:**
-  - Pending `Future` table keyed by `(expected_resp_type, seq)` for `Type 5/6`, `Type 9/10`, `Type 11/12`, `Type 13/14`, `Type 17/18`.
+  - Pending `Future` table keyed by `(expected_resp_type, seq)` for `Type 5/6`, `Type 9/10`, `Type 17/18`.
   - Incoming `Type 15` (`0x000F`) packets immediately transmit `Type 16` (`0x0010` + mirrored `seq` LE) before dispatching the telemetry payload to the coordinator.
 
 ### 2.5 `coordinator.py` (`FSLDataUpdateCoordinator`)
@@ -138,7 +132,7 @@ Implements `FSLUdpClient` backed by `asyncio.DatagramProtocol`:
   - Sends `Type 5` (`0x0005` + `seq`), awaits `Type 6` ASCII/UTF-8 URL.
   - Immediately executes an HTTP `GET` via `async_get_clientsession(hass)` (single-use URL).
   - On HTTP failure (timeout, `403`, `404`, or invalid JSON), automatically re-requests a fresh `Type 5` with an incremented `seq` up to **3 retries**.
-  - Parses `data[0].dataList` and Base64-decodes `devlist`, `familyInfo`, `grouplist`, and `scenelist`.
+  - Parses `data[0].dataList` and Base64-decodes `devlist` and `familyInfo`.
 - **Topology & Home Assistant Area Sync:**
   - Iterates `familyInfo["roomlist"]` and ensures each room (excluding or handling `roomId = 0` `"Whole House"` cleanly) exists via `area_registry.async_get_or_create(room_name)`.
   - Registers the parent Gateway device (`manufacturer="FSL"`, `identifiers={(DOMAIN, gateway_mac)}`, `connections={(dr.CONNECTION_NETWORK_MAC, gateway_mac)}`) and links all lighting devices via `via_device=(DOMAIN, gateway_mac)` with `suggested_area` set to the device's `roomName`.
@@ -154,8 +148,6 @@ Implements `FSLUdpClient` backed by `asyncio.DatagramProtocol`:
   - Schedules initial startup sweep and configurable periodic sweeps (from Options Flow; default disabled or conservative interval to rely on `local_push` without flooding BLE).
 - **Optimistic State & Command Dispatch:**
   - `async_control_short_addr(short_addr, payload)` (`Type 9`, `<H` short address + payload).
-  - `async_control_group(target_group_id, payload)` (`Type 13`, `B` group ID + `2A A8` + payload).
-  - `async_trigger_scene(room_id, scene_seq)` (`Type 11`, `>BBB` `[room_id, 0x00, scene_seq]`).
   - `async_query_radar_params(short_addr)` (`Type 9` with `91 00 00 00 00 00`).
 
 ### 2.6 `config_flow.py` & `strings.json`
@@ -216,15 +208,7 @@ Implements `FSLUdpClient` backed by `asyncio.DatagramProtocol`:
    - Decode: when `W + C > 0`, `kelvin = 2700 + round((C / (W + C)) * (6500 - 2700))`.
 6. **Fade Transitions (Firmware $\ge 58$):**
    - When `ATTR_TRANSITION` is provided (or Options Flow fade preference is enabled) on FW $\ge 58$ lights, prepend `b"\x80"` (fade enabled) or `b"\x00"` (instant) before the lighting payload (`[prefix, Bri/Power, B, R, G, W, C]`).
-7. **Lighting Group Control (`Type 13`):**
-   - Filter `grouplist` where `blecatetory` is in `{"LIGHT", "CWLIGHT", "RGBLIGHT", "RGBCWLIGHT"}` or `(groupId >> 8) == 0x01`.
-   - Convert virtual group IDs (`groupId > 255`): `target_group_id = group_id & 0xFF`.
-   - Transmit `Type 13`: `struct.pack("<B", target_group_id) + b"\x2a\xa8" + payload`.
-   - Expose each group as an `FSLLightGroupEntity` (e.g., `light.fsl_living_room_lights`) with assumed state / optimistic updates synced across member lights.
-8. **Scene Control (`Type 11`):**
-   - Parse `scenelist` entries (`moduleid` $\to$ `scene_seq`, `roomId` $\to$ `room_group_id`).
-   - Transmit `Type 11`: `struct.pack(">BBB", room_group_id, 0x00, scene_seq)`.
-9. **Extended Short Addressing ($> 255$):**
+7. **Extended Short Addressing ($> 255$):**
    - **Type 9 (Control):** 2-byte Little-Endian (`struct.pack("<H", short_addr)`).
    - **Type 17 (Status Poll):** 2-byte Big-Endian start address (`struct.pack(">H", start_addr)`).
    - **Type 15 (Telemetry Report):** Parse `addr_mode = chunk[0]`:
@@ -268,7 +252,7 @@ Attached to the same HA Device (`identifiers={(DOMAIN, sdid)}`) as the primary `
 - **Key Tasks:**
   1. Build the 12-light / 3-gateway catalog and `spid[24:28]` LE `dev_t` extractor.
   2. Implement `Type 5` $\to$ `Type 6` single-use HTTP GET manifest fetcher with up to 3 automatic retries on HTTP expiration/failure.
-  3. Decode Base64 `devlist`, `familyInfo`, `grouplist`, `scenelist`; filter non-lighting devices and optionally `ignoreflag: true` devices.
+  3. Decode Base64 `devlist` and `familyInfo`; filter non-lighting devices and optionally `ignoreflag: true` devices.
   4. Map `familyInfo.roomlist` to HA Areas and wire `DeviceInfo` with `manufacturer="FSL"`, `via_device` to the parent gateway, `model` preserving `type_no`/`dev_version`, and `suggested_area`.
   5. Implement rate-limited `Type 17` 104-device bitmask chunking (`delay_max = 31`, `1.5s` cooldown) and `Type 15` multi-chunk (`0x16`) + extended address (`0xC1+`) parser.
   6. Replace cloud `config_flow.py` with UDP discovery + manual IP/port/MAC entry, Gateway MAC `unique_id`, v1 $\to$ v2 entry migration, and Options Flow.
@@ -280,16 +264,14 @@ Attached to the same HA Device (`identifiers={(DOMAIN, sdid)}`) as the primary `
   1. Implement `FSLLightEntity` supporting all 12 FSL lighting `type_no` values and their exact `ColorMode` (`BRIGHTNESS`, `COLOR_TEMP`, `RGB`, `{RGB, COLOR_TEMP}`).
   2. Implement exact brightness (`1..127`), CCT (`2700K..6500K`, `C + W = 255`), RGB, single-byte `0x00` turn-off, `0x80` restore turn-on, and FW $\ge 58$ fade transition (`0x80`/`0x00` prefix) codecs.
   3. Support extended short addresses ($> 255$) in both control (`Type 9` LE) and telemetry (`Type 15` `0xC1+`).
-  4. Implement `FSLLightGroupEntity` for `grouplist` lighting groups using `Type 13` with virtual group ID conversion (`groupId & 0xFF`) and Parent PID `2A A8`.
-- **Exit Criteria:** All 12 lighting classes and group entities pass command encoding, state decoding, optimistic update, availability watchdog, and extended address tests.
+- **Exit Criteria:** All 12 lighting classes pass command encoding, state decoding, optimistic update, availability watchdog, and extended address tests.
 
-### Phase 4: Scene Platform, Radar Light Extensions & Services
-- **Deliverables:** `scene.py`, `switch.py`, `number.py`, `sensor.py`, `services.yaml`, `__init__.py`.
+### Phase 4: Radar Light Extensions & Services
+- **Deliverables:** `switch.py`, `number.py`, `sensor.py`, `services.yaml`, `__init__.py`.
 - **Key Tasks:**
-  1. Implement `FSLSceneEntity` (`scene.py`) sending `Type 11` with 3-byte Big-Endian `[room_group_id, 0x00, scene_seq]`.
-  2. Implement Radar Light (`338`, `347`) three-stage parameter query (`91 00 00 00 00 00`), `switch` (radar enable), `number` (high/mid/low brightness `%`, unoccupied hold time `s`, mid hold time `s`), and `sensor` (operating runtime `h` and energy consumption `kWh` for FW $\le 78$ and $\ge 79$).
-  3. Implement `fsl.reload_devices` service in `__init__.py` & `services.yaml` to trigger an on-demand `Type 5`/`Type 6` manifest refresh and entity/area reconciliation.
-- **Exit Criteria:** Scene activation sends exact `Type 11` frames; radar entities parse `00 E0` and telemetry frames and write back updated 8-byte parameter frames; reload service refreshes devices cleanly.
+  1. Implement Radar Light (`338`, `347`) three-stage parameter query (`91 00 00 00 00 00`), `switch` (radar enable), `number` (high/mid/low brightness `%`, unoccupied hold time `s`, mid hold time `s`), and `sensor` (operating runtime `h` and energy consumption `kWh` for FW $\le 78$ and $\ge 79$).
+  2. Implement `fsl.reload_devices` service in `__init__.py` & `services.yaml` to trigger an on-demand `Type 5`/`Type 6` manifest refresh and entity/area reconciliation.
+- **Exit Criteria:** Radar entities parse `00 E0` and telemetry frames and write back updated 8-byte parameter frames; reload service refreshes devices cleanly.
 
 ### Phase 5: Legacy Cleanup, Test Suite Overhaul & Quality Verification
 - **Deliverables:** Updated `config/tests/fsl/*`, cleaned component files, generated `translations/en.json`.
@@ -305,12 +287,11 @@ Attached to the same HA Device (`identifiers={(DOMAIN, sdid)}`) as the primary `
 
 ### 5.1 Planned Test Suite (`config/tests/fsl/`)
 All tests will use an in-memory/loopback **Mock UDP Gateway** simulating `Type 1`–`Type 18` frames and an isolated `aiohttp` response for `Type 6` HTTP manifest fetches—zero network/cloud access:
-- `conftest.py`: Mock UDP gateway simulator fixture, sample Base64-encoded family manifests (`devlist` covering all 12 lighting types + 3 gateway types + ignored/out-of-scope devices + short addresses `<= 255` and `> 255`, `familyInfo`, `grouplist`, `scenelist`).
+- `conftest.py`: Mock UDP gateway simulator fixture, sample Base64-encoded family manifests (`devlist` covering all 12 lighting types + 3 gateway types + ignored/out-of-scope devices + short addresses `<= 255` and `> 255`, and `familyInfo`).
 - `test_transport.py`: Framing byte order, `seq` rollover, 128-entry deduplication ring buffer, `Type 15` $\to$ `Type 16` ACK mirroring, 15s heartbeat loop, and 5-miss watchdog reconnect.
 - `test_config_flow.py`: Auto-discovery via `Type 1`/`Type 2`, manual entry fallback, MAC `unique_id` deduplication, IP update on rediscovery, error handling (`cannot_connect`, invalid response), and Options Flow.
-- `test_coordinator.py`: `Type 5`/`Type 6` single-use URL retry (up to 3x), Base64 decoding, `spid` $\to$ `dev_t` lookup, HA Area creation, `Type 17` 104-device mask chunking + `1.5s` cooldown + `delay_max = 31`, and availability transitions.
-- `test_light.py`: All 12 lighting device types, brightness `1..127` scaling, CCT `2700K..6500K` (`C + W = 255`), RGB color encoding, single-byte `0x00` off rule, `0x80` restore on, FW $\ge 58$ fade transitions, extended short addresses (`0xC1+`), and `Type 13` virtual group ID (`> 255` $\to$ `& 0xFF` + `2A A8`).
-- `test_scene.py`: `Type 11` 3-byte Big-Endian scene triggers and `fsl.reload_devices` service.
+- `test_coordinator.py`: `Type 5`/`Type 6` single-use URL retry (up to 3x), Base64 decoding, `spid` $\to$ `dev_t` lookup, HA Area creation, `Type 17` 104-device mask chunking + `1.5s` cooldown + `delay_max = 31`, `fsl.reload_devices` service, and availability transitions.
+- `test_light.py`: All 12 lighting device types, brightness `1..127` scaling, CCT `2700K..6500K` (`C + W = 255`), RGB color encoding, single-byte `0x00` off rule, `0x80` restore on, FW $\ge 58$ fade transitions, and extended short addresses (`0xC1+`).
 - `test_radar_light.py`: `338`/`347` `91 00 00 00 00 00` parameter query, `00 E0` parsing, `switch` & `number` writes, and `FW <= 78` / `FW >= 79` runtime & energy `sensor` calculations.
 
 ### 5.2 Verification Commands

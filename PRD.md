@@ -20,8 +20,8 @@ Refactor `custom_components/fsl` from its legacy cloud-polling prototype (`smart
 * **HA Brands Repository:** Include brand assets (`icon.png`, `logo.png`) structured for `home-assistant/brands` under `custom_integrations/fsl`.
 
 ### 1.3 Core Objectives
-1. **Zero-Cloud Lighting Control:** Execute all single-light commands, lighting group broadcasts, and lighting scene triggers locally over UDP.
-2. **Automatic Topology & Area Discovery:** Retrieve the home manifest (`devlist`, `familyInfo`, `grouplist`, `scenelist`) via the gateway's temporary HTTP URL (Type 5/6) and map FSL rooms and lights to Home Assistant Areas and Devices automatically.
+1. **Zero-Cloud Lighting Control:** Execute all single-light control commands locally over UDP.
+2. **Automatic Topology & Area Discovery:** Retrieve the home manifest (`devlist` and `familyInfo`) via the gateway's temporary HTTP URL (Type 5/6) and map FSL rooms and lights to Home Assistant Areas and Devices automatically.
 3. **Focused Lighting Coverage:** Strictly support the **12 FSL lighting device types** from `docs/default_dev_type.csv` whose `dev_t` exists in `docs/broadlink_whole_house_device_functions_and_profile_specification.md` (`W`, `CW`, `RGB`, `RGBCW`, and Radar/Induction lights).
 4. **Resilient Session Management:** Maintain reliable local UDP communication through 15-second heartbeat keep-alives, sequence deduplication, and self-healing reconnection logic.
 
@@ -37,8 +37,7 @@ Refactor `custom_components/fsl` from its legacy cloud-polling prototype (`smart
 |  +-------------+  +---------------+  +-------------------------+  |
 |  | Config Flow |  | Area & Device |  |    Entity Platforms     |  |
 |  |   ("FSL")   |  |   Registry    |  | - light (Primary)       |  |
-|  +------+------+  +-------+-------+  | - scene (Type 11)       |  |
-|         |                 |          | - switch/number/sensor  |  |
+|  +------+------+  +-------+-------+  | - switch/number/sensor  |  |
 |         |                 |          |   (Radar Light Ext.)    |  |
 |         v                 v          +------------+------------+  |
 |  +-------------------------------------------------------------+  |
@@ -76,7 +75,7 @@ Refactor `custom_components/fsl` from its legacy cloud-polling prototype (`smart
   * Maintain a rolling cache of the last 128 received `seq` numbers to drop retransmitted duplicate packets.
 * **Metadata Synchronization (Type 5 $\to$ Type 6):**
   * Upon connection establishment (and via `fsl.reload_devices`), send **Type 5** to obtain the single-use HTTP URL from **Type 6**.
-  * Immediately download the JSON manifest, Base64-decode `devlist`, `familyInfo`, `grouplist`, and `scenelist`, and map `roomlist` entries to Home Assistant Areas.
+  * Immediately download the JSON manifest, Base64-decode `devlist` and `familyInfo`, and map `roomlist` entries to Home Assistant Areas.
 
 ### 2.3 State Synchronization Strategy
 * **Asynchronous Push (Type 15 / Type 16):**
@@ -112,6 +111,7 @@ The current version integrates **12 FSL lighting device types** spanning **7 Bro
 > **Gateway Transport Role:** The FASTCON BLE Gateway (`325` `GATEWAY` / `43500`, `333` `WIRE_GATEWAY` / `44602`, `345` `4G_WIFI_ROUTER` / `44862`) acts solely as the local UDP bridge and parent device (`via_device`) in the Device Registry.
 
 ### 3.2 Out of Scope for the Current Version
+* **Group & Scene Mapping / Control:** Lighting group mapping and control (`grouplist` / Type 13) and scene mapping and control (`scenelist` / Type 11) are excluded; grouping and scenes are managed natively within Home Assistant.
 * **Non-Lighting Device Categories:** Relay switches, composite panels, scene panels, curtains, thermostats/HVAC, standalone sensors, and virtual remotes are deferred from this release.
 * **Unmatched / Unverified Lights:**
   * BroadLink spec light PIDs without a matching `dev_t` in `default_dev_type.csv`: `43169` (`a1 a8` RGBW), `45559` (`f7 b1`), `45408` (`60 b1`), `45161` (`69 b0`).
@@ -147,14 +147,6 @@ Supports all **12 matched lighting device types** via the standard 6-byte lighti
   * `switch`: Radar Enable/Disable (`Byte 0`).
   * `number`: High/Occupied Brightness ($\%$, `Byte 1`), Mid Brightness ($\%$, `Byte 5`), Standby/Low Brightness ($\%$, `Byte 2`), Unoccupied Hold Time (`nobody_keep_time` in $\text{s}$, `Bytes 3–4` LE), and Mid Brightness Hold Time ($\text{s}$, `Bytes 6–7` LE).
   * `sensor`: Operating Runtime ($\text{h}$) and Energy Consumption ($\text{kWh}$, from $\frac{\text{Integral} \times 8}{\text{Runtime} \times 127} \times \text{RatedPower} \times \text{Time}$).
-
-### 4.3 Lighting Group & Scene Control
-* **Native Lighting Group Control (Type 13):**
-  * Parse `grouplist` entries matching lighting categories (`blecatetory` in `LIGHT`, `CWLIGHT`, `RGBLIGHT`, `RGBCWLIGHT`, or `groupId` upper byte `0x01`).
-  * When `groupId > 255` (Virtual Group ID, e.g., `257 = 0x0101`), compute $\text{TargetGroupID} = \text{groupId} \ \& \ 0\text{xFF}$ and transmit **Type 13** using the Lighting Parent PID **`2A A8`**.
-  * Expose each lighting group as a native HA `light` entity (e.g., `light.fsl_living_room_lights`) to eliminate "popcorn effect" latency.
-* **Native Scene Entities (Type 11):**
-  * Parse `scenelist` and create HA `scene` entities that trigger **Type 11 (`0x000B`)** with the 3-byte Big-Endian Scene ID (`[RoomGroupID, 0x00, SceneSeq]`).
 
 ---
 

@@ -1,0 +1,8 @@
+reload_devices:
+  fields:
+    entry_id:
+      required: false
+      example: "01JABCDEF1234567890"
+      selector:
+        config_entry:
+          integration: fsl

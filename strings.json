@@ -2,27 +2,64 @@
   "config": {
     "step": {
       "user": {
-        "title": "Connect to FSL",
-        "description": "Enter the sign-in code for the FSL IoT cloud. It will be saved to renew your access token automatically.",
+        "title": "Select FSL Gateway",
+        "description": "Choose a discovered FSL gateway on your local network or enter its connection details manually.",
         "data": {
-          "code": "Sign-in code"
+          "gateway": "Gateway"
         }
       },
-      "reauth_confirm": {
-        "title": "Reconnect to FSL",
-        "description": "Your FSL session could not be renewed. Enter the sign-in code once to save it for future automatic token renewal. Your existing devices and entities will be kept.",
+      "manual": {
+        "title": "Connect to FSL Gateway",
+        "description": "Enter the local IP address and UDP port of your FSL gateway.",
         "data": {
-          "code": "Sign-in code"
+          "host": "Host",
+          "port": "UDP port",
+          "client_mac": "Client MAC address"
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigure FSL Gateway",
+        "description": "Update the local connection details for your FSL gateway.",
+        "data": {
+          "host": "Host",
+          "port": "UDP port",
+          "client_mac": "Client MAC address"
         }
       }
     },
     "abort": {
-      "reauth_successful": "Authentication was successful."
+      "already_configured": "Device is already configured",
+      "reconfigure_successful": "Reconfiguration was successful.",
+      "unique_id_mismatch": "The selected gateway MAC address does not match this entry."
     },
     "error": {
-      "cannot_connect": "Could not reach the FSL IoT cloud. Please check your network and try again.",
-      "invalid_auth": "The sign-in code was rejected. Please check the code and try again.",
+      "cannot_connect": "Could not reach the FSL gateway over UDP. Please check the IP address, port, and network.",
+      "invalid_mac": "Invalid MAC address format. Use 6 hex bytes such as 02:00:00:00:00:54.",
       "unknown": "Unexpected error"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "FSL Options",
+        "data": {
+          "fade_transition": "Enable smooth fade transitions (FW >= 58)",
+          "filter_ignored": "Filter ignored devices",
+          "poll_interval": "Status polling interval (seconds, 0 to disable)"
+        }
+      }
+    }
+  },
+  "services": {
+    "reload_devices": {
+      "name": "Reload devices",
+      "description": "Re-fetch the FSL gateway manifest (Type 5/6), synchronize rooms to Areas, and poll light statuses.",
+      "fields": {
+        "entry_id": {
+          "name": "Config entry",
+          "description": "Optional FSL gateway config entry to reload. Reloads all FSL entries when omitted."
+        }
+      }
     }
   }
 }

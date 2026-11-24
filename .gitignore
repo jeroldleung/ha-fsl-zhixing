@@ -11,3 +11,6 @@ wheels/
 
 # Development documentation
 dev_docs/
+
+# Pytest cache
+.pytest_cache/

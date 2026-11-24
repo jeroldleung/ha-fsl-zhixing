@@ -1,0 +1,16 @@
+[project]
+name = "ha-fsl-zhixing"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "jeroldleung", email = "jeroldleung@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "homeassistant>=2026.2.3",
+    "pytest>=9.2.0",
+]

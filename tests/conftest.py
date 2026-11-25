@@ -260,11 +260,13 @@ class MockUdpGateway:
         self.mac_bytes = parse_mac_bytes(mac)
 
         self.protocols: list[asyncio.DatagramProtocol] = []
+        self.endpoint_calls: list[dict[str, Any]] = []
         self.sent_frames: list[tuple[bytes, tuple[str, int]]] = []
         self.received_by_type: dict[int, list[tuple[int, bytes]]] = defaultdict(list)
         self.control_commands: list[tuple[int, bytes]] = []
         self.status_triggers: list[tuple[int, int, bytes]] = []
         self.telemetry_acks: list[int] = []
+        self.telemetry_ack_addrs: list[tuple[str, int]] = []
 
         self.respond_probe = True
         self.drop_heartbeats = 0
@@ -288,6 +290,13 @@ class MockUdpGateway:
         **kwargs: Any,
     ) -> tuple[asyncio.DatagramTransport, asyncio.DatagramProtocol]:
         """Bind a protocol to an in-memory MockDatagramTransport."""
+        self.endpoint_calls.append(
+            {
+                "local_addr": local_addr,
+                "remote_addr": remote_addr,
+                "allow_broadcast": allow_broadcast,
+            }
+        )
         protocol = protocol_factory()
         transport = MockDatagramTransport(self, protocol, remote_addr)
         self.protocols.append(protocol)
@@ -326,19 +335,27 @@ class MockUdpGateway:
                 self._reply(protocol, pack_frame(MSG_STATUS_TRIGGER_RESP, seq))
         elif msg_type == MSG_DATA_REPORT_RESP:
             self.telemetry_acks.append(seq)
+            self.telemetry_ack_addrs.append(addr)
 
     def _reply(self, protocol: asyncio.DatagramProtocol, frame: bytes) -> None:
         self.loop.call_soon(protocol.datagram_received, frame, (self.ip, self.port))
 
-    def push_telemetry(self, seq: int, chunks: list[tuple[int, bytes]]) -> None:
+    def push_telemetry(
+        self,
+        seq: int,
+        chunks: list[tuple[int, bytes]],
+        *,
+        source_addr: tuple[str, int] | None = None,
+    ) -> None:
         """Push a Type 15 telemetry frame to active client protocols."""
         payload = b"".join(
             make_telemetry_chunk(short_addr, dev_payload)
             for short_addr, dev_payload in chunks
         )
         frame = pack_frame(MSG_DATA_REPORT_REQ, seq, payload)
+        sender = source_addr or (self.ip, self.port)
         for protocol in list(self.protocols):
-            protocol.datagram_received(frame, (self.ip, self.port))
+            protocol.datagram_received(frame, sender)
 
 
 def build_http_response(

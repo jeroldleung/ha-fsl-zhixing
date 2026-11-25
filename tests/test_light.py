@@ -282,7 +282,7 @@ async def test_telemetry_updates_light_states(
     mock_gateway.push_telemetry(
         42,
         [
-            (1, bytes([0xFF, 0, 0, 0, 0, 0])),
+            (1, bytes([0x7F, 0, 0, 0, 0, 0])),
             (2, bytes([0x80 | 64, 0, 0, 0, 255, 0])),
             (3, bytes([0xFF, 30, 10, 20, 0, 0])),
             (264, bytes([0xFF, 0, 0, 0, 0, 255])),

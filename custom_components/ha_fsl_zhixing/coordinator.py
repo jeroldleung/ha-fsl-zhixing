@@ -2,9 +2,11 @@
 
 import asyncio
 import base64
+from contextlib import suppress
 from datetime import timedelta
 import json
 import logging
+import time
 from typing import Any
 
 import aiohttp
@@ -39,8 +41,18 @@ from .const import (
     DOMAIN,
     MANIFEST_FETCH_MAX_RETRIES,
     POLL_CHUNK_COOLDOWN,
+    POLL_FAST_DELAY_MAX,
+    POLL_FAST_MAX_DEVICES,
+    POLL_ROUND1_WAIT,
+    POLL_ROUND2_WAIT,
+    POLL_SINGLE_DELAY_MAX,
+    POLL_SWEEP_DELAY_MAX,
 )
-from .transport import FSLTransportError, FSLUdpClient, build_status_trigger_payloads
+from .transport import (
+    FSLTransportError,
+    FSLUdpClient,
+    build_status_trigger_payloads,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -125,6 +137,9 @@ class FSLDataUpdateCoordinator(DataUpdateCoordinator[dict[int, FSLLightDevice]])
         self._gateway_available = True
         self._poll_lock = asyncio.Lock()
         self._recovery_task: asyncio.Task[None] | None = None
+        self._poll_followup_task: asyncio.Task[None] | None = None
+        self._active_poll_responded: set[int] | None = None
+        self._active_poll_event: asyncio.Event | None = None
 
         self.client = FSLUdpClient(
             hass.loop,
@@ -144,6 +159,15 @@ class FSLDataUpdateCoordinator(DataUpdateCoordinator[dict[int, FSLLightDevice]])
         """Connect to the gateway, synchronize manifest, and run initial poll."""
         try:
             await self.client.async_connect()
+            try:
+                await self.client.async_probe()
+            except FSLTransportError as err:
+                _LOGGER.debug(
+                    "Unicast Type 1 probe failed during startup for %s:%s (%s); continuing with Type 3 heartbeat",
+                    self.host,
+                    self.port,
+                    err,
+                )
             mac = await self.client.async_heartbeat()
         except FSLTransportError as err:
             await self.client.async_close()
@@ -166,15 +190,19 @@ class FSLDataUpdateCoordinator(DataUpdateCoordinator[dict[int, FSLLightDevice]])
             ) from err
 
         try:
-            await self.async_poll_device_statuses()
+            await self.async_poll_device_statuses(schedule_retry=True)
         except FSLTransportError as err:
-            _LOGGER.debug("Initial Type 17 status poll incomplete: %s", err)
+            _LOGGER.warning("Initial Type 17 status poll failed: %s", err)
 
     async def async_shutdown(self) -> None:
         """Cancel background tasks and close the UDP client."""
-        if self._recovery_task is not None:
-            self._recovery_task.cancel()
-            self._recovery_task = None
+        for task_attr in ("_recovery_task", "_poll_followup_task"):
+            task: asyncio.Task[None] | None = getattr(self, task_attr)
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+                setattr(self, task_attr, None)
         await self.client.async_close()
         await super().async_shutdown()
 
@@ -183,7 +211,7 @@ class FSLDataUpdateCoordinator(DataUpdateCoordinator[dict[int, FSLLightDevice]])
         if not self._gateway_available:
             raise UpdateFailed("FSL gateway heartbeat timed out")
         try:
-            await self.async_poll_device_statuses()
+            await self.async_poll_device_statuses(schedule_retry=True)
         except FSLTransportError as err:
             raise UpdateFailed(f"Failed to poll FSL devices: {err}") from err
         return self.data
@@ -313,19 +341,133 @@ class FSLDataUpdateCoordinator(DataUpdateCoordinator[dict[int, FSLLightDevice]])
         )
 
     async def async_poll_device_statuses(
-        self, short_addrs: list[int] | None = None
+        self,
+        short_addrs: list[int] | None = None,
+        *,
+        delay_max: int | None = None,
+        schedule_retry: bool = False,
     ) -> None:
         """Send rate-limited Type 17 status queries across up to 104 devices per chunk."""
-        targets = short_addrs if short_addrs is not None else list(self.data)
-        payloads = build_status_trigger_payloads(targets)
+        targets = sorted(
+            {addr for addr in (short_addrs if short_addrs is not None else self.data) if addr > 0}
+        )
+        effective_delay = delay_max
+        if effective_delay is None and schedule_retry:
+            if len(targets) == 1:
+                effective_delay = POLL_SINGLE_DELAY_MAX
+            elif len(targets) <= POLL_FAST_MAX_DEVICES:
+                effective_delay = POLL_FAST_DELAY_MAX
+            else:
+                effective_delay = POLL_SWEEP_DELAY_MAX
+
+        payloads = build_status_trigger_payloads(targets, delay_max=effective_delay)
         if not payloads:
+            _LOGGER.debug("Skipping Type 17 status poll: no target devices")
             return
 
-        async with self._poll_lock:
-            for idx, payload in enumerate(payloads):
-                if idx > 0:
-                    await asyncio.sleep(POLL_CHUNK_COOLDOWN)
-                await self.client.async_trigger_status_report(payload)
+        responded: set[int] | None = None
+        event: asyncio.Event | None = None
+        if schedule_retry:
+            if self._poll_followup_task is not None and not self._poll_followup_task.done():
+                self._poll_followup_task.cancel()
+            responded = set()
+            event = asyncio.Event()
+            self._active_poll_responded = responded
+            self._active_poll_event = event
+
+        _LOGGER.debug(
+            "Polling status for %d FSL device(s) in %d Type 17 chunk(s) (delay_max=%s): %s",
+            len(targets),
+            len(payloads),
+            effective_delay if effective_delay is not None else "default",
+            targets,
+        )
+        try:
+            async with self._poll_lock:
+                for idx, payload in enumerate(payloads):
+                    if idx > 0:
+                        await asyncio.sleep(POLL_CHUNK_COOLDOWN)
+                    await self.client.async_trigger_status_report(payload)
+        except Exception:
+            if responded is not None and self._active_poll_responded is responded:
+                self._active_poll_responded = None
+                self._active_poll_event = None
+            raise
+
+        if schedule_retry and responded is not None and event is not None:
+            self._poll_followup_task = self.hass.async_create_background_task(
+                self._async_poll_followup(targets, responded, event),
+                name=f"{DOMAIN}_status_poll_followup",
+            )
+
+    async def _async_wait_for_poll_responses(
+        self,
+        targets: list[int],
+        responded: set[int],
+        event: asyncio.Event,
+        duration: float,
+    ) -> list[int]:
+        """Wait up to duration seconds for all target short_addrs to report Type 15."""
+        deadline = time.monotonic() + duration
+        while True:
+            missing = [addr for addr in targets if addr not in responded]
+            if not missing:
+                return []
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return missing
+            event.clear()
+            try:
+                await asyncio.wait_for(event.wait(), timeout=remaining)
+            except TimeoutError:
+                return [addr for addr in targets if addr not in responded]
+
+    async def _async_poll_followup(
+        self,
+        targets: list[int],
+        responded: set[int],
+        event: asyncio.Event,
+    ) -> None:
+        """Wait for round-1 Type 15 responses and run a round-2 retry for missing devices."""
+        try:
+            missing = await self._async_wait_for_poll_responses(
+                targets, responded, event, POLL_ROUND1_WAIT
+            )
+            if not missing:
+                _LOGGER.debug(
+                    "All %d polled FSL device(s) responded in round 1", len(targets)
+                )
+                return
+
+            _LOGGER.debug(
+                "Round 1 missing Type 15 status from %s; sending round 2 (delay_max=%d)",
+                missing,
+                POLL_SWEEP_DELAY_MAX,
+            )
+            try:
+                await self.async_poll_device_statuses(
+                    missing, delay_max=POLL_SWEEP_DELAY_MAX
+                )
+            except FSLTransportError as err:
+                _LOGGER.debug("Round 2 Type 17 status retry failed: %s", err)
+                return
+
+            still_missing = await self._async_wait_for_poll_responses(
+                missing, responded, event, POLL_ROUND2_WAIT
+            )
+            if still_missing:
+                _LOGGER.debug(
+                    "No Type 15 status received after 2 poll rounds for short_addrs=%s",
+                    still_missing,
+                )
+            else:
+                _LOGGER.debug(
+                    "All %d polled FSL device(s) responded after round 2", len(targets)
+                )
+        finally:
+            if self._active_poll_responded is responded:
+                self._active_poll_responded = None
+                self._active_poll_event = None
 
     async def async_control_light(self, short_addr: int, payload: bytes) -> None:
         """Send a Type 9 unicast lighting control payload to a sub-device."""
@@ -365,12 +507,39 @@ class FSLDataUpdateCoordinator(DataUpdateCoordinator[dict[int, FSLLightDevice]])
         for short_addr, dev_payload in chunks:
             device = self.data.get(short_addr)
             if device is None:
+                if _LOGGER.isEnabledFor(logging.DEBUG):
+                    _LOGGER.debug(
+                        "Ignoring Type 15 telemetry for unknown short_addr=%d (known=%s, payload=%s)",
+                        short_addr,
+                        sorted(self.data),
+                        dev_payload.hex(" "),
+                    )
                 continue
             decoded = decode_light_state(dev_payload, device.spec)
             if decoded is None:
+                if _LOGGER.isEnabledFor(logging.DEBUG):
+                    _LOGGER.debug(
+                        "Failed to decode Type 15 payload for short_addr=%d (%s): %s",
+                        short_addr,
+                        device.name,
+                        dev_payload.hex(" "),
+                    )
                 continue
-            self.states[short_addr] = _merge_light_state(
-                self.states.get(short_addr), decoded
+            merged = _merge_light_state(self.states.get(short_addr), decoded)
+            self.states[short_addr] = merged
+            if self._active_poll_responded is not None:
+                self._active_poll_responded.add(short_addr)
+                if self._active_poll_event is not None:
+                    self._active_poll_event.set()
+            _LOGGER.debug(
+                "Updated state for short_addr=%d (%s): is_on=%s bri=%s cct=%s rgb=%s mode=%s",
+                short_addr,
+                device.name,
+                merged.is_on,
+                merged.brightness_ha,
+                merged.color_temp_kelvin,
+                merged.rgb_color,
+                merged.color_mode,
             )
             updated = True
 
@@ -390,6 +559,6 @@ class FSLDataUpdateCoordinator(DataUpdateCoordinator[dict[int, FSLLightDevice]])
     async def _async_recover_statuses(self) -> None:
         """Refresh light statuses once the gateway recovers from a timeout."""
         try:
-            await self.async_poll_device_statuses()
+            await self.async_poll_device_statuses(schedule_retry=True)
         except FSLTransportError as err:
             _LOGGER.debug("Post-recovery Type 17 status poll failed: %s", err)

@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 import logging
+import random
 import socket
 import struct
 
@@ -96,13 +97,27 @@ def parse_telemetry_chunks(payload: bytes) -> list[tuple[int, bytes]]:
         chunk_len = payload[idx]
         idx += 1
         if chunk_len <= 0 or idx + chunk_len > len(payload):
+            if _LOGGER.isEnabledFor(logging.DEBUG):
+                _LOGGER.debug(
+                    "Stopping Type 15 parse at offset %d: chunk_len=%d, payload=%s",
+                    idx - 1,
+                    chunk_len,
+                    payload.hex(" "),
+                )
             break
         chunk = payload[idx : idx + chunk_len]
         idx += chunk_len
-        if len(chunk) >= 8 and (chunk[0] & 0xF0) == 0xC0:
+        if len(chunk) >= 8:
             # 0xC0 handles <= 255; 0xC1+ stores bits 8..11 in the low nibble of Byte 0.
-            short_addr = ((chunk[0] & 0x0F) << 8) | chunk[4]
+            short_addr_msb = (chunk[0] & 0x0F) if (chunk[0] & 0xF0) == 0xC0 else 0
+            short_addr = (short_addr_msb << 8) | chunk[4]
             chunks.append((short_addr, chunk[7:]))
+        elif _LOGGER.isEnabledFor(logging.DEBUG):
+            _LOGGER.debug(
+                "Skipping short Type 15 chunk (len=%d): %s",
+                len(chunk),
+                chunk.hex(" "),
+            )
     return chunks
 
 
@@ -158,11 +173,12 @@ class FSLUdpClient(asyncio.DatagramProtocol):
         self._host = host
         self._port = port
         self._client_mac_bytes = parse_mac_bytes(client_mac)
+        self._client_mac = format_mac_bytes(self._client_mac_bytes)
         self._on_telemetry = on_telemetry
         self._on_availability_changed = on_availability_changed
 
         self._transport: asyncio.DatagramTransport | None = None
-        self._seq = 0
+        self._seq = random.randint(1, 0xFFF0)
         self._pending: dict[tuple[int, int], asyncio.Future[bytes]] = {}
         self._recent_telemetry_seqs: deque[int] = deque(maxlen=SEQ_DEDUP_CACHE_SIZE)
         self._heartbeat_task: asyncio.Task[None] | None = None
@@ -205,20 +221,45 @@ class FSLUdpClient(asyncio.DatagramProtocol):
             return
 
         if msg_type == MSG_DATA_REPORT_REQ:
+            if _LOGGER.isEnabledFor(logging.DEBUG):
+                _LOGGER.debug(
+                    "Received Type 15 telemetry from %s (seq=%d, len=%d): %s",
+                    addr,
+                    seq,
+                    len(payload),
+                    payload.hex(" "),
+                )
             # Always ACK with exact seq so gateway stops retransmitting duplicates.
-            self._send_raw(pack_frame(MSG_DATA_REPORT_RESP, seq))
+            self._send_raw(pack_frame(MSG_DATA_REPORT_RESP, seq), addr)
             if seq in self._recent_telemetry_seqs:
+                _LOGGER.debug(
+                    "Ignoring duplicate Type 15 telemetry seq=%d from %s", seq, addr
+                )
                 return
             self._recent_telemetry_seqs.append(seq)
             if self._on_telemetry is not None:
                 chunks = parse_telemetry_chunks(payload)
                 if chunks:
                     self._on_telemetry(chunks)
+                elif _LOGGER.isEnabledFor(logging.DEBUG):
+                    _LOGGER.debug(
+                        "No parseable device chunks in Type 15 seq=%d payload=%s",
+                        seq,
+                        payload.hex(" "),
+                    )
             return
 
         future = self._pending.pop((msg_type, seq), None)
         if future is not None and not future.done():
             future.set_result(payload)
+        elif _LOGGER.isEnabledFor(logging.DEBUG):
+            _LOGGER.debug(
+                "Received unmatched UDP frame from %s: type=0x%04x seq=%d payload=%s",
+                addr,
+                msg_type,
+                seq,
+                payload.hex(" "),
+            )
 
     def error_received(self, exc: Exception) -> None:
         """Log socket-level datagram errors."""
@@ -233,26 +274,34 @@ class FSLUdpClient(asyncio.DatagramProtocol):
                 if not future.done():
                     future.set_exception(FSLTransportError(str(exc)))
 
-    def _send_raw(self, frame: bytes) -> None:
+    def _send_raw(
+        self, frame: bytes, addr: tuple[str, int] | None = None
+    ) -> None:
         """Transmit a pre-encoded UDP frame if the transport is open."""
         if self._transport is None or self._transport.is_closing():
             raise FSLTransportError("UDP transport is not connected")
-        self._transport.sendto(frame, (self._host, self._port))
+        self._transport.sendto(frame, addr or (self._host, self._port))
 
     async def async_connect(self) -> None:
-        """Open the UDP datagram socket toward the gateway."""
+        """Open an unconnected UDP datagram socket for communicating with the gateway."""
         if self._transport is not None and not self._transport.is_closing():
             return
         self._closed = False
         try:
             await self._loop.create_datagram_endpoint(
                 lambda: self,
-                remote_addr=(self._host, self._port),
+                local_addr=("0.0.0.0", 0),
             )
         except OSError as err:
             raise FSLTransportError(
                 f"Failed to open UDP endpoint to {self._host}:{self._port}: {err}"
             ) from err
+        _LOGGER.debug(
+            "Opened UDP socket on %s for FSL gateway %s:%s",
+            self._transport.get_extra_info("sockname") if self._transport else None,
+            self._host,
+            self._port,
+        )
 
     async def async_close(self) -> None:
         """Stop heartbeats, cancel pending requests, and close the transport."""
@@ -309,14 +358,7 @@ class FSLUdpClient(asyncio.DatagramProtocol):
     async def _async_re_register(self) -> None:
         """Attempt a Type 1 probe re-registration toward the configured gateway."""
         try:
-            payload = await self.async_request(
-                MSG_PROBE_REQ,
-                MSG_PROBE_RESP,
-                self._client_mac_bytes,
-                timeout=DISCOVERY_TIMEOUT,
-            )
-            if len(payload) == 6:
-                self._gateway_mac = format_mac_bytes(payload)
+            await self.async_probe()
         except FSLTransportError:
             pass
 
@@ -349,8 +391,43 @@ class FSLUdpClient(asyncio.DatagramProtocol):
         finally:
             self._pending.pop(key, None)
 
+    async def async_probe(self, *, timeout: float | None = None) -> str:
+        """Send a unicast Type 1 Probe Request and return the gateway MAC."""
+        effective_timeout = timeout if timeout is not None else DISCOVERY_TIMEOUT
+        _LOGGER.debug(
+            "Sending Type 1 probe to %s:%s (client_mac=%s)",
+            self._host,
+            self._port,
+            self._client_mac,
+        )
+        payload = await self.async_request(
+            MSG_PROBE_REQ,
+            MSG_PROBE_RESP,
+            self._client_mac_bytes,
+            timeout=effective_timeout,
+        )
+        if len(payload) != 6:
+            raise FSLTransportError(
+                f"Expected 6-byte gateway MAC in Type 2 response, got {len(payload)}"
+            )
+        mac = format_mac_bytes(payload)
+        self._gateway_mac = mac
+        _LOGGER.debug(
+            "Received Type 2 probe response from %s:%s (gateway_mac=%s)",
+            self._host,
+            self._port,
+            mac,
+        )
+        return mac
+
     async def async_heartbeat(self, *, timeout: float | None = None) -> str:
         """Send a Type 3 Heartbeat Request and return the gateway MAC."""
+        _LOGGER.debug(
+            "Sending Type 3 heartbeat to %s:%s (client_mac=%s)",
+            self._host,
+            self._port,
+            self._client_mac,
+        )
         payload = await self.async_request(
             MSG_HEARTBEAT_REQ,
             MSG_HEARTBEAT_RESP,
@@ -397,12 +474,26 @@ class FSLUdpClient(asyncio.DatagramProtocol):
         timeout: float | None = None,
     ) -> None:
         """Send a Type 17 Trigger Device Status Report and await Type 18 ACK."""
-        await self.async_request(
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            _LOGGER.debug(
+                "Sending Type 17 status trigger to %s:%s: %s",
+                self._host,
+                self._port,
+                trigger_payload.hex(" "),
+            )
+        resp = await self.async_request(
             MSG_STATUS_TRIGGER_REQ,
             MSG_STATUS_TRIGGER_RESP,
             trigger_payload,
             timeout=timeout,
         )
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            _LOGGER.debug(
+                "Received Type 18 status trigger ACK from %s:%s (payload=%s)",
+                self._host,
+                self._port,
+                resp.hex(" "),
+            )
 
 
 class _DiscoveryProtocol(asyncio.DatagramProtocol):

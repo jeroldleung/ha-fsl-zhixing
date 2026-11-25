@@ -433,8 +433,8 @@ def decode_light_state(payload: bytes, spec: FSLLightSpec) -> FSLLightState | No
         return None
 
     byte0 = payload[0]
-    is_on = bool(byte0 & 0x80)
     bri_bl = byte0 & 0x7F
+    is_on = bool(byte0 & 0x80) or bri_bl > 0
     brightness_ha = bl_brightness_to_ha(bri_bl) if is_on and bri_bl > 0 else None
 
     b_val = payload[1] if len(payload) > 1 else 0

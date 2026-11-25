@@ -194,6 +194,36 @@ async def test_rate_limited_type17_chunk_cooldown(
     mock_sleep.assert_called_once_with(POLL_CHUNK_COOLDOWN)
 
 
+async def test_two_round_status_poll_retries_missing_devices(
+    hass: HomeAssistant,
+    setup_fsl: MockConfigEntry,
+    mock_gateway: MockUdpGateway,
+) -> None:
+    """Use delay_max=7 on round 1 and retry only missing short_addrs with delay_max=31."""
+    mock_gateway.status_triggers.clear()
+    coordinator = setup_fsl.runtime_data
+
+    with (
+        patch("custom_components.ha_fsl_zhixing.coordinator.POLL_ROUND1_WAIT", 0.02),
+        patch("custom_components.ha_fsl_zhixing.coordinator.POLL_ROUND2_WAIT", 0.02),
+    ):
+        await coordinator.async_poll_device_statuses([1, 2], schedule_retry=True)
+        # Only device 1 responds in round 1; device 2 is missing.
+        mock_gateway.push_telemetry(901, [(1, bytes([0x7F, 0, 0, 0, 0, 0]))])
+        assert coordinator._poll_followup_task is not None  # noqa: SLF001
+        await coordinator._poll_followup_task  # noqa: SLF001
+
+    assert len(mock_gateway.status_triggers) == 2
+    # Round 1: delay_max=7, start_addr=1, mask bit0+bit1 (0x03)
+    assert mock_gateway.status_triggers[0][0] == 7
+    assert mock_gateway.status_triggers[0][1] == 1
+    assert mock_gateway.status_triggers[0][2][0] == 0x03
+    # Round 2: delay_max=31, start_addr=2, mask bit0 (0x01)
+    assert mock_gateway.status_triggers[1][0] == 31
+    assert mock_gateway.status_triggers[1][1] == 2
+    assert mock_gateway.status_triggers[1][2][0] == 0x01
+
+
 async def test_reload_devices_service(
     hass: HomeAssistant,
     setup_fsl: MockConfigEntry,

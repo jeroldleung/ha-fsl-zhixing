@@ -30,6 +30,7 @@ from .const import (
 )
 from .transport import (
     FSLDiscoveredGateway,
+    FSLTimeoutError,
     FSLTransportError,
     FSLUdpClient,
     async_discover_gateways,
@@ -38,6 +39,14 @@ from .transport import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _derive_probe_mac(client_mac: str) -> str:
+    """Derive a distinct locally-administered MAC for config-flow validation."""
+    raw = bytearray(parse_mac_bytes(client_mac))
+    raw[0] = (raw[0] | 0x02) & 0xFE
+    raw[5] ^= 0xFF
+    return format_mac_bytes(bytes(raw))
 
 CONF_GATEWAY = "gateway"
 MANUAL_CHOICE = "manual"
@@ -81,12 +90,26 @@ class FSLConfigFlow(ConfigFlow, domain=DOMAIN):
     async def _async_validate_connection(
         self, host: str, port: int, client_mac: str
     ) -> tuple[str, str]:
-        """Verify UDP connectivity with the gateway and return (gateway_mac, client_mac)."""
+        """Verify UDP connectivity with the gateway and return (gateway_mac, client_mac).
+
+        Uses a distinct locally-administered probe MAC so config-flow validation never
+        registers or overwrites the real client_mac on a throwaway ephemeral UDP port.
+        Tries unicast Type 1 Probe first and falls back to Type 3 Heartbeat on timeout.
+        """
         normalized_client_mac = format_mac_bytes(parse_mac_bytes(client_mac))
-        client = FSLUdpClient(self.hass.loop, host, port, normalized_client_mac)
+        probe_mac = _derive_probe_mac(normalized_client_mac)
+        client = FSLUdpClient(self.hass.loop, host, port, probe_mac)
         try:
             await client.async_connect()
-            raw_gateway_mac = await client.async_heartbeat()
+            try:
+                raw_gateway_mac = await client.async_probe()
+            except FSLTimeoutError:
+                _LOGGER.debug(
+                    "Unicast Type 1 probe timed out for %s:%s; falling back to Type 3",
+                    host,
+                    port,
+                )
+                raw_gateway_mac = await client.async_heartbeat()
         finally:
             await client.async_close()
         return dr.format_mac(raw_gateway_mac), normalized_client_mac

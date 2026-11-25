@@ -44,3 +44,8 @@ When `transition` is provided on `light.turn_on` or `light.turn_off` (and enable
 
 - **Risk:** Sending six zero bytes (`00 00 00 00 00 00`) fails to turn off lights under the BroadLink protocol.
 - **Mitigation:** Always transmit a single byte `0x00` on `light.turn_off` when no transition prefix is applied.
+
+## Edge Case: Type 15 Telemetry Power-State Decoding
+
+- **Risk:** Real FSL/BroadLink lights can report an ON state in Type 15 telemetry with Bit 7 = `0` and non-zero brightness (`0x01–0x7F`, e.g., `0x7F` for 100% ON), whereas checking only `bool(byte0 & 0x80)` misreports them as OFF.
+- **Mitigation:** Decode power state as `is_on = bool(byte0 & 0x80) or (byte0 & 0x7F) > 0` (`0x00` is OFF; `0x80` is ON restoring cached brightness).

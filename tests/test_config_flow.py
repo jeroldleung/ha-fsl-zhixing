@@ -13,7 +13,10 @@ from custom_components.ha_fsl_zhixing.const import (
     DEFAULT_CLIENT_MAC,
     DEFAULT_UDP_PORT,
     DOMAIN,
+    MSG_HEARTBEAT_REQ,
+    MSG_PROBE_REQ,
 )
+from custom_components.ha_fsl_zhixing.transport import parse_mac_bytes
 import pytest
 
 from homeassistant.config_entries import SOURCE_USER
@@ -25,9 +28,9 @@ from tests.common import MockConfigEntry  # noqa: TID251
 from .conftest import GATEWAY_IP, GATEWAY_MAC, MockUdpGateway
 
 
-@pytest.mark.usefixtures("register_fsl", "mock_gateway")
+@pytest.mark.usefixtures("register_fsl")
 async def test_user_discovery_select_gateway(
-    hass: HomeAssistant, mock_session: MagicMock
+    hass: HomeAssistant, mock_gateway: MockUdpGateway, mock_session: MagicMock
 ) -> None:
     """Discover a gateway via Type 1/2 probe and create the entry on selection."""
     with (
@@ -57,6 +60,11 @@ async def test_user_discovery_select_gateway(
         CONF_CLIENT_MAC: DEFAULT_CLIENT_MAC,
         CONF_GATEWAY_MAC: GATEWAY_MAC,
     }
+    # Config-flow validation probe uses a distinct MAC; coordinator startup uses client_mac.
+    probe_payloads = [payload for _, payload in mock_gateway.received_by_type[MSG_PROBE_REQ]]
+    assert len(probe_payloads) >= 3
+    assert probe_payloads[1] != parse_mac_bytes(DEFAULT_CLIENT_MAC)
+    assert probe_payloads[2] == parse_mac_bytes(DEFAULT_CLIENT_MAC)
 
 
 @pytest.mark.usefixtures("register_fsl")
@@ -126,6 +134,12 @@ async def test_no_discovery_falls_back_to_manual(
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"][CONF_GATEWAY_MAC] == GATEWAY_MAC
+    # Fallback Type 3 during config flow uses a distinct MAC so it does not collide
+    # with the configured client_mac used immediately afterward by coordinator.async_start.
+    hb_payloads = [payload for _, payload in mock_gateway.received_by_type[MSG_HEARTBEAT_REQ]]
+    assert len(hb_payloads) >= 2
+    assert hb_payloads[0] != parse_mac_bytes(DEFAULT_CLIENT_MAC)
+    assert hb_payloads[1] == parse_mac_bytes(DEFAULT_CLIENT_MAC)
 
 
 @pytest.mark.usefixtures("register_fsl", "mock_gateway")
@@ -243,11 +257,13 @@ async def test_discovery_step_connect_error_and_unexpected(
         result = await hass.config_entries.flow.async_init(
             DOMAIN, context={"source": SOURCE_USER}
         )
+        mock_gateway.respond_probe = False
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], user_input={CONF_GATEWAY: GATEWAY_MAC}
         )
         assert result["type"] is FlowResultType.FORM
         assert result["errors"] == {"base": "cannot_connect"}
+        assert len(mock_gateway.received_by_type[MSG_PROBE_REQ]) >= 2
 
     with patch(
         "custom_components.ha_fsl_zhixing.config_flow.FSLConfigFlow._async_validate_connection",

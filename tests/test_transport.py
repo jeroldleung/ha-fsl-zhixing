@@ -73,16 +73,23 @@ def test_invalid_mac_raises(bad_mac: str) -> None:
 
 
 def test_parse_telemetry_chunks_standard_and_extended() -> None:
-    """Decode both <=255 (0xC0) and >255 (0xC1+) Type 15 telemetry chunks."""
-    payload = make_telemetry_chunk(8, b"\x7f\x00\x00\xff\x00\x00") + make_telemetry_chunk(
-        257, b"\xc0\x00\x00\x00\x80\x7f"
+    """Decode standard (0xC0), extended (0xC1+), and non-0xC* Type 15 chunks."""
+    non_c0_chunk = (
+        bytes([22, 0x40, 0x01, 0x02, 0x03, 5, 0x00, 0x60, 0x7F]) + b"\x00" * 14
+    )
+    payload = (
+        make_telemetry_chunk(8, b"\x7f\x00\x00\xff\x00\x00")
+        + make_telemetry_chunk(257, b"\xc0\x00\x00\x00\x80\x7f")
+        + non_c0_chunk
     )
     chunks = parse_telemetry_chunks(payload)
-    assert len(chunks) == 2
+    assert len(chunks) == 3
     assert chunks[0][0] == 8
     assert chunks[0][1][:6] == b"\x7f\x00\x00\xff\x00\x00"
     assert chunks[1][0] == 257
     assert chunks[1][1][:6] == b"\xc0\x00\x00\x00\x80\x7f"
+    assert chunks[2][0] == 5
+    assert chunks[2][1][0] == 0x7F
 
 
 def test_build_status_trigger_payloads() -> None:
@@ -118,11 +125,41 @@ def test_build_status_trigger_payloads() -> None:
 
 
 async def test_sequence_wraparound(hass: HomeAssistant) -> None:
-    """Wrap 16-bit sequence numbers from 65535 back to 1."""
+    """Initialize seq randomly in 1..0xFFF0 and wrap 16-bit sequence numbers back to 1."""
     client = FSLUdpClient(hass.loop, GATEWAY_IP, DEFAULT_UDP_PORT, DEFAULT_CLIENT_MAC)
+    assert 1 <= client._seq <= 0xFFF0  # noqa: SLF001
     client._seq = 0xFFFE  # noqa: SLF001
     assert client._next_seq() == 0xFFFF  # noqa: SLF001
     assert client._next_seq() == 1  # noqa: SLF001
+
+
+async def test_unconnected_udp_socket_and_async_probe(
+    hass: HomeAssistant, mock_gateway: MockUdpGateway
+) -> None:
+    """Bind an unconnected UDP socket, support unicast Type 1 probe, and ACK to sender."""
+    received: list[list[tuple[int, bytes]]] = []
+    client = FSLUdpClient(
+        hass.loop,
+        GATEWAY_IP,
+        DEFAULT_UDP_PORT,
+        on_telemetry=received.append,
+    )
+    await client.async_connect()
+    try:
+        assert mock_gateway.endpoint_calls[-1]["local_addr"] == ("0.0.0.0", 0)
+        assert mock_gateway.endpoint_calls[-1]["remote_addr"] is None
+
+        assert await client.async_probe(timeout=0.1) == GATEWAY_MAC
+
+        alt_addr = (GATEWAY_IP, 59999)
+        mock_gateway.push_telemetry(
+            77, [(8, b"\x80\x00\x00\x00\xff\x00")], source_addr=alt_addr
+        )
+        assert len(received) == 1
+        assert mock_gateway.telemetry_acks[-1] == 77
+        assert mock_gateway.telemetry_ack_addrs[-1] == alt_addr
+    finally:
+        await client.async_close()
 
 
 async def test_telemetry_ack_and_deduplication(

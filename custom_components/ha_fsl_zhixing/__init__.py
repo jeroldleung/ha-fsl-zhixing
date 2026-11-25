@@ -63,7 +63,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     f"Failed to reload FSL devices for {entry.title}: {err}"
                 ) from err
             try:
-                await coordinator.async_poll_device_statuses()
+                await coordinator.async_poll_device_statuses(schedule_retry=True)
             except FSLTransportError as err:
                 _LOGGER.debug("Post-reload Type 17 poll failed: %s", err)
 
